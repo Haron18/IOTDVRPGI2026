@@ -47,6 +47,7 @@ Corrections apportées par rapport à la version générée initialement :
     livrée (pour la liste des commandes annulables), jamais par sondage.
 """
 
+import inspect
 import math
 import time
 from datetime import datetime
@@ -787,8 +788,7 @@ def render_simulation():
         # commande livrée (liste des commandes annulables) et une commande qui vient
         # d'atteindre son release_time (`new_order_arrived`), qui force une replanification
         # OR-Tools immédiate au lieu d'attendre le prochain événement manuel.
-        result = dvrp_map(
-            depot_coords, orders_payload, cancelled_payload, trucks_payload,
+        dvrp_map_kwargs = dict(
             sim_clock_start_min=float(sim_time),
             sim_minutes_per_real_second=sim_minutes_per_real_second,
             auto_run=auto_run,
@@ -810,8 +810,25 @@ def render_simulation():
             # GPS simulée pour détecter la "fin de tournée" côté composant React : le
             # plan calculé est déjà définitif, donc on force l'affichage du panneau de
             # résultats finaux dès qu'il y a des commandes à router.
-            instant_finish=not is_tracking and len(active_orders) > 0,
+            instant_finish=bool(not is_tracking and len(active_orders) > 0),
         )
+        # GARDE-FOU DE DÉPLOIEMENT : `instant_finish` n'existe que dans la version à
+        # jour de dvrp_map_component/__init__.py. Si seul app.py a été redéployé (sans
+        # le reste du dossier dvrp_map_component/, y compris frontend/build/bundle.js),
+        # l'appeler planterait l'app entière avec un TypeError. On vérifie donc la
+        # signature réellement disponible et on retire l'argument au besoin, avec un
+        # avertissement explicite plutôt qu'un crash.
+        if "instant_finish" not in inspect.signature(dvrp_map).parameters:
+            dvrp_map_kwargs.pop("instant_finish")
+            st.warning(
+                "⚠️ Le composant carte (`dvrp_map_component`) semble être une version "
+                "plus ancienne que `app.py` : le paramètre `instant_finish` n'est pas "
+                "reconnu, donc le panneau de résultats finaux ne s'affichera pas en "
+                "mode statique / sans tracking. Vérifiez que **tout** le dossier "
+                "`dvrp_map_component/` (y compris `frontend/build/bundle.js` et "
+                "`bundle.css`) a bien été redéployé — pas seulement `app.py`."
+            )
+        result = dvrp_map(depot_coords, orders_payload, cancelled_payload, trucks_payload, **dvrp_map_kwargs)
         if result:
             # Persiste le kilométrage cumulé rapporté par le composant : il sert de
             # nouveau point de départ ("checkpoint") au prochain recalcul OR-Tools, pour
