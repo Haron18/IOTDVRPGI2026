@@ -47,13 +47,13 @@ Corrections apportées par rapport à la version générée initialement :
     livrée (pour la liste des commandes annulables), jamais par sondage.
 """
 
-import inspect
 import math
 import time
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 
 from dvrp_map_component import dvrp_map
@@ -788,100 +788,166 @@ def render_simulation():
         # commande livrée (liste des commandes annulables) et une commande qui vient
         # d'atteindre son release_time (`new_order_arrived`), qui force une replanification
         # OR-Tools immédiate au lieu d'attendre le prochain événement manuel.
-        dvrp_map_kwargs = dict(
-            sim_clock_start_min=float(sim_time),
-            sim_minutes_per_real_second=sim_minutes_per_real_second,
-            auto_run=auto_run,
-            planned_distance_km=optimized_distance_km,
-            baseline_distance_km=baseline_distance_km,
-            gain_pct=gain_pct,
-            num_vehicles_used=len(truck_trips),
-            num_vehicles_total=num_vehicles,
-            height=480,
-            key="dvrp_map",
-            # CORRECTIF (compteurs "commandes livrées" / "distance parcourue" erronés) :
-            # on transmet l'historique fiable côté Python (jamais réinitialisé), pour
-            # que le composant amorce ses compteurs avec le total réel depuis le début
-            # de la simulation, au lieu de repartir de zéro à chaque recalcul OR-Tools
-            # (nouvelle commande, livraison, panne, etc. — voir index.jsx).
-            already_delivered_ids=list(st.session_state.delivered_ids),
-            already_traveled_km=st.session_state.traveled_km_checkpoint,
-            # Sans tracking (statique ou dynamique sans GPS), il n'y a aucune position
-            # GPS simulée pour détecter la "fin de tournée" côté composant React : le
-            # plan calculé est déjà définitif, donc on force l'affichage du panneau de
-            # résultats finaux dès qu'il y a des commandes à router.
-            instant_finish=bool(not is_tracking and len(active_orders) > 0),
-        )
-        # GARDE-FOU DE DÉPLOIEMENT : `instant_finish` n'existe que dans la version à
-        # jour de dvrp_map_component/__init__.py. Si seul app.py a été redéployé (sans
-        # le reste du dossier dvrp_map_component/, y compris frontend/build/bundle.js),
-        # l'appeler planterait l'app entière avec un TypeError. On vérifie donc la
-        # signature réellement disponible et on retire l'argument au besoin, avec un
-        # avertissement explicite plutôt qu'un crash.
-        if "instant_finish" not in inspect.signature(dvrp_map).parameters:
-            dvrp_map_kwargs.pop("instant_finish")
-            st.warning(
-                "⚠️ Le composant carte (`dvrp_map_component`) semble être une version "
-                "plus ancienne que `app.py` : le paramètre `instant_finish` n'est pas "
-                "reconnu, donc le panneau de résultats finaux ne s'affichera pas en "
-                "mode statique / sans tracking. Vérifiez que **tout** le dossier "
-                "`dvrp_map_component/` (y compris `frontend/build/bundle.js` et "
-                "`bundle.css`) a bien été redéployé — pas seulement `app.py`."
+        #
+        # RÉSERVÉ AU MODE TRACKING : sans position GPS simulée (statique / dynamique
+        # sans tracking), ce composant reste bloqué sur son affichage "temps réel en
+        # pause" (horloge figée à 0, "En attente de télémétrie...") — peu lisible pour
+        # un résultat qui est en réalité déjà définitif. Ces deux modes ont leur propre
+        # rendu natif, ci-dessous (carte statique + résultats), pensé pour eux.
+        if is_tracking:
+            dvrp_map_kwargs = dict(
+                sim_clock_start_min=float(sim_time),
+                sim_minutes_per_real_second=sim_minutes_per_real_second,
+                auto_run=auto_run,
+                planned_distance_km=optimized_distance_km,
+                baseline_distance_km=baseline_distance_km,
+                gain_pct=gain_pct,
+                num_vehicles_used=len(truck_trips),
+                num_vehicles_total=num_vehicles,
+                height=480,
+                key="dvrp_map",
+                # CORRECTIF (compteurs "commandes livrées" / "distance parcourue" erronés) :
+                # on transmet l'historique fiable côté Python (jamais réinitialisé), pour
+                # que le composant amorce ses compteurs avec le total réel depuis le début
+                # de la simulation, au lieu de repartir de zéro à chaque recalcul OR-Tools
+                # (nouvelle commande, livraison, panne, etc. — voir index.jsx).
+                already_delivered_ids=list(st.session_state.delivered_ids),
+                already_traveled_km=st.session_state.traveled_km_checkpoint,
             )
-        result = dvrp_map(depot_coords, orders_payload, cancelled_payload, trucks_payload, **dvrp_map_kwargs)
-        if result:
-            # Persiste le kilométrage cumulé rapporté par le composant : il sert de
-            # nouveau point de départ ("checkpoint") au prochain recalcul OR-Tools, pour
-            # que "distance parcourue" ne redescende jamais et reflète le vrai total.
-            reported_km = result.get("distance_parcourue_km")
-            if reported_km is not None:
-                st.session_state.traveled_km_checkpoint = float(reported_km)
+            result = dvrp_map(depot_coords, orders_payload, cancelled_payload, trucks_payload, **dvrp_map_kwargs)
+            if result:
+                # Persiste le kilométrage cumulé rapporté par le composant : il sert de
+                # nouveau point de départ ("checkpoint") au prochain recalcul OR-Tools, pour
+                # que "distance parcourue" ne redescende jamais et reflète le vrai total.
+                reported_km = result.get("distance_parcourue_km")
+                if reported_km is not None:
+                    st.session_state.traveled_km_checkpoint = float(reported_km)
 
-            # CORRECTIF (bug de résurrection des commandes livrées) : on FUSIONNE
-            # (union, |=) au lieu d'ÉCRASER (=) l'ensemble des commandes livrées.
-            #
-            # Pourquoi c'est nécessaire : à CHAQUE appel à OR-Tools (nouvelle commande
-            # arrivée, annulation, panne véhicule...), les tournées changent, donc la
-            # `structuralKey` du composant React change, donc TOUT le state d'animation
-            # React est réinitialisé (voir dvrp_map_component/frontend/src/index.jsx) —
-            # chaque camion repart virtuellement à 0 km sur son nouveau plan. À la toute
-            # première frame après ce reset, `deliveredIds` calculé côté navigateur est
-            # donc temporairement VIDE (aucun camion n'a encore reparcouru de distance),
-            # et cette valeur transitoire est immédiatement renvoyée à Python.
-            #
-            # Avec une simple affectation (`=`), cette valeur vide ÉCRASAIT
-            # `st.session_state.delivered_ids` : les commandes déjà livrées perdaient
-            # leur statut, étaient réintégrées dans `active_orders` (filtre plus haut)
-            # et renvoyées à OR-Tools comme si elles n'avaient jamais été livrées —
-            # provoquant une re-livraison logique (et potentiellement une boucle, un
-            # nouvel appel OR-Tools réinitialisant à nouveau le state React, etc.).
-            #
-            # `delivered_ids` doit être un ensemble MONOTONE CROISSANT : une commande
-            # livrée le reste, quel que soit le nombre de réoptimisations ultérieures.
-            st.session_state.delivered_ids |= set(result.get("delivered_ids", []))
+                # CORRECTIF (bug de résurrection des commandes livrées) : on FUSIONNE
+                # (union, |=) au lieu d'ÉCRASER (=) l'ensemble des commandes livrées.
+                #
+                # Pourquoi c'est nécessaire : à CHAQUE appel à OR-Tools (nouvelle commande
+                # arrivée, annulation, panne véhicule...), les tournées changent, donc la
+                # `structuralKey` du composant React change, donc TOUT le state d'animation
+                # React est réinitialisé (voir dvrp_map_component/frontend/src/index.jsx) —
+                # chaque camion repart virtuellement à 0 km sur son nouveau plan. À la toute
+                # première frame après ce reset, `deliveredIds` calculé côté navigateur est
+                # donc temporairement VIDE (aucun camion n'a encore reparcouru de distance),
+                # et cette valeur transitoire est immédiatement renvoyée à Python.
+                #
+                # Avec une simple affectation (`=`), cette valeur vide ÉCRASAIT
+                # `st.session_state.delivered_ids` : les commandes déjà livrées perdaient
+                # leur statut, étaient réintégrées dans `active_orders` (filtre plus haut)
+                # et renvoyées à OR-Tools comme si elles n'avaient jamais été livrées —
+                # provoquant une re-livraison logique (et potentiellement une boucle, un
+                # nouvel appel OR-Tools réinitialisant à nouveau le state React, etc.).
+                #
+                # `delivered_ids` doit être un ensemble MONOTONE CROISSANT : une commande
+                # livrée le reste, quel que soit le nombre de réoptimisations ultérieures.
+                st.session_state.delivered_ids |= set(result.get("delivered_ids", []))
 
-            # REPLANIFICATION DYNAMIQUE : le composant React signale qu'une commande vient
-            # d'atteindre son release_time (elle "arrive" à l'instant `sim_clock`). On fait
-            # avancer l'horloge Python jusqu'à cet instant (pour que le filtre release_time
-            # <= horloge, plus haut, l'inclue désormais) puis on relance tout le script :
-            # active_orders changera, donc un nouveau calcul OR-Tools aura lieu et la
-            # séquence de l'itinéraire construite sera mise à jour en conséquence.
-            new_arrival_id = result.get("new_order_arrived")
-            if new_arrival_id:
-                arrival_clock = float(result.get("sim_clock", st.session_state.sim_clock_min))
-                st.session_state.sim_clock_min = max(st.session_state.sim_clock_min, arrival_clock)
-                log_event(f"🆕 Commande {new_arrival_id} arrivée → replanification de l'itinéraire.")
-                st.rerun()
-            # Arrêt automatique de la simulation temps réel dès que toutes les livraisons
-            # sont terminées (le composant React le signale via all_finished). On ne peut
-            # pas modifier auto_run_active ici directement (le toggle est déjà instancié
-            # dans CE run) : on passe par stop_requested, appliqué au tout début du
-            # prochain run. Protégé par la vérification de auto_run_active pour ne
-            # déclencher ce rerun qu'une seule fois (pas de boucle infinie une fois arrêté).
-            elif result.get("all_finished") and st.session_state.auto_run_active:
-                st.session_state.stop_requested = True
-                log_event("⏹️ Simulation arrêtée automatiquement — toutes les livraisons sont terminées.")
-                st.rerun()
+                # REPLANIFICATION DYNAMIQUE : le composant React signale qu'une commande vient
+                # d'atteindre son release_time (elle "arrive" à l'instant `sim_clock`). On fait
+                # avancer l'horloge Python jusqu'à cet instant (pour que le filtre release_time
+                # <= horloge, plus haut, l'inclue désormais) puis on relance tout le script :
+                # active_orders changera, donc un nouveau calcul OR-Tools aura lieu et la
+                # séquence de l'itinéraire construite sera mise à jour en conséquence.
+                new_arrival_id = result.get("new_order_arrived")
+                if new_arrival_id:
+                    arrival_clock = float(result.get("sim_clock", st.session_state.sim_clock_min))
+                    st.session_state.sim_clock_min = max(st.session_state.sim_clock_min, arrival_clock)
+                    log_event(f"🆕 Commande {new_arrival_id} arrivée → replanification de l'itinéraire.")
+                    st.rerun()
+                # Arrêt automatique de la simulation temps réel dès que toutes les livraisons
+                # sont terminées (le composant React le signale via all_finished). On ne peut
+                # pas modifier auto_run_active ici directement (le toggle est déjà instancié
+                # dans CE run) : on passe par stop_requested, appliqué au tout début du
+                # prochain run. Protégé par la vérification de auto_run_active pour ne
+                # déclencher ce rerun qu'une seule fois (pas de boucle infinie une fois arrêté).
+                elif result.get("all_finished") and st.session_state.auto_run_active:
+                    st.session_state.stop_requested = True
+                    log_event("⏹️ Simulation arrêtée automatiquement — toutes les livraisons sont terminées.")
+                    st.rerun()
+
+        else:
+            # ------------------------------------------------------------------------
+            # RENDU NATIF (statique / dynamique sans tracking) : carte pydeck STATIQUE
+            # (aucune animation, aucune dépendance au composant React) + résultats
+            # clairement présentés (preuve d'optimisation, statuts des commandes).
+            # ------------------------------------------------------------------------
+            if len(active_orders) > 0:
+                r1, r2, r3 = st.columns(3)
+                r1.metric("📏 Distance planifiée", f"{optimized_distance_km:.1f} km",
+                          delta=f"-{gain_pct:.0f} % vs non optimisé", delta_color="normal")
+                r2.metric("📉 Distance sans optimisation", f"{baseline_distance_km:.1f} km")
+                r3.metric("💰 Gain apporté par OR-Tools", f"{gain_pct:.0f} %")
+            elif len(future_orders) > 0:
+                st.info(f"⏳ En attente de l'arrivée de {len(future_orders)} commande(s) pour la prochaine tournée.")
+            else:
+                st.success("✅ Toutes les commandes connues ont été traitées.")
+
+            ROUTE_COLORS_RGB = {
+                "blue": [31, 119, 180], "green": [44, 160, 44], "purple": [148, 103, 189],
+                "orange": [255, 127, 14], "darkred": [140, 0, 0], "cadetblue": [95, 158, 160],
+            }
+            # Couleur du camion assigné à chaque commande routée (via ses arrêts) — permet
+            # de colorer les marqueurs de commandes de la même couleur que leur tournée.
+            order_color_by_id: dict[str, list[int]] = {}
+            for t in trucks_payload:
+                if not t.get("used"):
+                    continue
+                rgb = ROUTE_COLORS_RGB.get(t["color"], [70, 70, 70])
+                for stop in t.get("stops", []):
+                    order_color_by_id[stop["order_id"]] = rgb
+
+            path_data = [
+                {"path": [[lon, lat] for lat, lon in t["shape"]],
+                 "color": ROUTE_COLORS_RGB.get(t["color"], [70, 70, 70]), "label": t["label"]}
+                for t in trucks_payload if t.get("used")
+            ]
+            order_points = []
+            for o in orders_payload:
+                if o.get("delivered"):
+                    color, status = [34, 139, 34], "✅ Livrée"
+                elif o.get("pending"):
+                    color, status = [170, 170, 170], "🕓 En attente"
+                else:
+                    color, status = order_color_by_id.get(o["id"], [70, 70, 70]), "🚚 En tournée"
+                order_points.append({
+                    "lon": o["lon"], "lat": o["lat"], "color": color,
+                    "name": o["client"], "id": o["id"], "kg": o["demand_kg"], "status": status,
+                })
+            depot_point = [{"lon": depot_coords[1], "lat": depot_coords[0], "name": "🏭 Dépôt", "status": "", "kg": ""}]
+
+            if path_data or order_points:
+                layers = [
+                    pdk.Layer("PathLayer", data=path_data, get_path="path", get_color="color",
+                               width_min_pixels=4, pickable=False),
+                    pdk.Layer("ScatterplotLayer", data=order_points, get_position=["lon", "lat"],
+                               get_fill_color="color", get_radius=70, radius_min_pixels=5,
+                               radius_max_pixels=13, pickable=True, stroked=True,
+                               get_line_color=[255, 255, 255], line_width_min_pixels=1),
+                    pdk.Layer("ScatterplotLayer", data=depot_point, get_position=["lon", "lat"],
+                               get_fill_color=[20, 20, 20], get_radius=160, radius_min_pixels=9,
+                               pickable=True, stroked=True, get_line_color=[255, 255, 255],
+                               line_width_min_pixels=2),
+                ]
+                st.pydeck_chart(
+                    pdk.Deck(
+                        layers=layers,
+                        initial_view_state=pdk.ViewState(
+                            latitude=depot_coords[0], longitude=depot_coords[1], zoom=11, pitch=0,
+                        ),
+                        tooltip={"text": "{name}\n{status} {kg}"},
+                    ),
+                    height=480,
+                )
+                st.caption(
+                    "⬛ Dépôt · 🟢 Livrée · ⚪ En attente · 🔵 En tournée (couleur = camion assigné) "
+                    "— carte statique, sans animation."
+                )
+            else:
+                st.info("Aucune commande à afficher sur la carte pour l'instant.")
 
         if is_tracking:
             st.caption(
@@ -891,12 +957,9 @@ def render_simulation():
             )
         elif is_dynamic_no_tracking:
             st.caption(
-                "🔄 Aucune position GPS simulée : les camions ne sont pas animés sur la "
-                "carte. Utilisez « ✅ Marquer la tournée courante comme livrée » (barre "
-                "latérale) pour faire progresser la simulation."
+                "🔄 Utilisez « ✅ Marquer la tournée courante comme livrée » (barre latérale) "
+                "pour faire progresser la simulation vers la prochaine tournée."
             )
-        else:
-            st.caption("🧊 Calcul statique unique — pas d'animation, pas d'horloge.")
 
     with col_details:
         st.subheader("🗺️ Séquence de l'itinéraire construite")
@@ -936,6 +999,27 @@ def render_simulation():
                     f"{prefix}({load}/{vehicle_capacity} kg, {trip_km:.1f} km) : "
                     + " → ".join(["Dépôt"] + stops_names + ["Dépôt"])
                 )
+
+        if not is_tracking:
+            st.subheader("📋 Commandes")
+            table_rows = []
+            for o in orders_payload:
+                status = "✅ Livrée" if o.get("delivered") else ("🕓 En attente" if o.get("pending") else "🚚 En tournée")
+                table_rows.append({
+                    "ID": o["id"], "Client": o["client"], "Kg": o["demand_kg"],
+                    "Priorité": o["priority"], "Statut": status,
+                })
+            for o in cancelled_payload:
+                table_rows.append({
+                    "ID": o["id"], "Client": o["client"], "Kg": o["demand_kg"],
+                    "Priorité": o["priority"], "Statut": "❌ Annulée",
+                })
+            if table_rows:
+                st.dataframe(
+                    pd.DataFrame(table_rows), hide_index=True, width="stretch", height=220,
+                )
+            else:
+                st.caption("Aucune commande connue pour l'instant.")
 
         if is_tracking:
             st.subheader("📡 Télémétrie MQTT")
