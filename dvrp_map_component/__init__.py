@@ -67,6 +67,7 @@ def dvrp_map(
     key: str | None = None,
     already_delivered_ids: list | None = None,
     already_traveled_km: float = 0.0,
+    instant_finish: bool = False,
 ):
     """
     depot_coords : (lat, lon)
@@ -94,6 +95,12 @@ def dvrp_map(
     already_traveled_km : kilométrage déjà parcouru par la flotte selon Python
         (checkpoint conservé entre deux recalculs). Sert à AMORCER le compteur
         "distance parcourue" du composant pour la même raison.
+    instant_finish : si True (mode statique ou dynamique sans tracking, où aucune
+        position GPS n'est jamais simulée), force l'affichage immédiat du panneau
+        "🎉 résultats finaux" — sans quoi il ne s'afficherait jamais, puisqu'il
+        dépend normalement d'une distance parcourue simulée qui reste à 0 sans
+        tracking. N'affecte ni la position des camions ni le statut des commandes
+        (aucune livraison n'est marquée automatiquement).
 
     Retourne un dict {"delivered_ids": [...], "all_finished": bool,
     "distance_parcourue_km": float, ...} ou None tant que rien n'a encore été
@@ -117,6 +124,7 @@ def dvrp_map(
         key=key,
         already_delivered_ids=list(already_delivered_ids or []),
         already_traveled_km=already_traveled_km,
+        instant_finish=instant_finish,
         default=None,
     )
 

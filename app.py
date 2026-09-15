@@ -676,10 +676,17 @@ def render_simulation():
             f"la capacité en un seul passage est insuffisante avec les paramètres actuels."
         )
 
-    # La preuve d'optimisation (distance avant/après, gain) n'est plus affichée ici de
-    # façon statique — elle apparaît désormais dans le panneau "🎉 Tournée terminée" du
-    # composant React, une fois la simulation effectivement terminée (voir plus bas :
-    # planned_distance_km / baseline_distance_km / gain_pct transmis à dvrp_map()).
+    # La preuve d'optimisation (distance avant/après, gain) apparaît normalement dans
+    # le panneau "🎉 Tournée terminée" du composant React, une fois la simulation
+    # effectivement terminée (les camions ont fini de parcourir leur tracé GPS —
+    # voir dvrp_map_component/frontend/src/index.jsx : kpi.allFinished).
+    #
+    # La preuve d'optimisation (distance avant/après, gain) apparaît dans le panneau
+    # "🎉 Tournée terminée" du composant React (voir plus bas, argument
+    # `instant_finish` de dvrp_map()) : affiché dès qu'il y a des commandes routées
+    # en mode statique ou dynamique sans tracking (aucune position GPS n'est jamais
+    # simulée dans ces deux cas, donc le plan est déjà définitif dès son calcul), et
+    # une fois la simulation GPS effectivement terminée en mode avec tracking.
 
     if st.session_state.logs:
         st.info(f"Dernier événement : {st.session_state.logs[0]}")
@@ -799,6 +806,11 @@ def render_simulation():
             # (nouvelle commande, livraison, panne, etc. — voir index.jsx).
             already_delivered_ids=list(st.session_state.delivered_ids),
             already_traveled_km=st.session_state.traveled_km_checkpoint,
+            # Sans tracking (statique ou dynamique sans GPS), il n'y a aucune position
+            # GPS simulée pour détecter la "fin de tournée" côté composant React : le
+            # plan calculé est déjà définitif, donc on force l'affichage du panneau de
+            # résultats finaux dès qu'il y a des commandes à router.
+            instant_finish=not is_tracking and len(active_orders) > 0,
         )
         if result:
             # Persiste le kilométrage cumulé rapporté par le composant : il sert de
