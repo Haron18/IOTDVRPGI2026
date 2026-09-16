@@ -83,14 +83,6 @@ function DvrpMap({ args }) {
     // chaque recalcul OR-Tools, donc à chaque livraison ou nouvelle commande).
     already_delivered_ids: alreadyDeliveredIds = [],
     already_traveled_km: alreadyTraveledKm = 0,
-    // CORRECTIF (résultats finaux invisibles sans tracking GPS) : `allFinished` était
-    // calculé uniquement à partir de la distance parcourue simulée par chaque camion
-    // (traveledKm >= totalKm). Sans tracking (mode statique ou dynamique sans GPS),
-    // `autoRun` est toujours false : la distance parcourue reste figée à 0 pour
-    // toujours, et le panneau "🎉 Tournée terminée" ne s'affichait donc JAMAIS, même
-    // pour un plan déjà définitif (mode statique). `instant_finish`, transmis par
-    // Python pour ces cas-là, force l'affichage immédiat du panneau de résultats.
-    instant_finish: instantFinish = false,
   } = args;
 
   const wrapperRef = useRef(null);
@@ -232,16 +224,12 @@ function DvrpMap({ args }) {
       // Distance parcourue DANS CE SEGMENT (depuis le dernier recalcul OR-Tools) —
       // le cumul réel affiché/renvoyé ajoute `alreadyTraveledKm` plus bas.
       let segmentDistanceKm = 0;
-      let allUsedFinished = usedCount > 0;      Object.values(truckStateRef.current).forEach((s) => {
+      let allUsedFinished = usedCount > 0;
+      Object.values(truckStateRef.current).forEach((s) => {
         if (!s.used) return;
         const traveledKm = Math.min(s.totalKm, (s.speedKmh * (simClockMin - baseMin)) / 60);
         segmentDistanceKm += traveledKm;
-        // `instantFinish` (mode statique / dynamique sans tracking) : le plan est
-        // déjà définitif dès son calcul, il n'y a pas de position GPS à animer — on
-        // considère donc directement la tournée "terminée" pour l'affichage du
-        // panneau de résultats, SANS pour autant marquer les commandes comme
-        // livrées (aucune livraison réelle n'a eu lieu) ni déplacer les camions.
-        if (!instantFinish && traveledKm < s.totalKm) allUsedFinished = false;
+        if (traveledKm < s.totalKm) allUsedFinished = false;
         const pos = interpolate(s.shape, s.cumKm, traveledKm);
         if (pos) s.marker.setLatLng(pos);
         s.stops.forEach((stop) => {
