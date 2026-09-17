@@ -129,9 +129,9 @@ st.markdown("---")
 # ----------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
 # 2bis. ONGLETS : simulation en direct (comportement d'origine, inchangé) vs
-#       comparatif pédagogique statique / dynamique sans tracking / tracking.
+#       comparatif pédagogique dynamique sans tracking / dynamique avec tracking.
 # ----------------------------------------------------------------------------
-main_tab, compare_tab = st.tabs(["🚚 Simulation en direct", "📊 Comparatif Statique / Dynamique / Tracking"])
+main_tab, compare_tab = st.tabs(["🚚 Simulation en direct", "📊 Comparatif Sans tracking / Avec tracking"])
 
 with main_tab:
     st.sidebar.header("📁 Jeu de données")
