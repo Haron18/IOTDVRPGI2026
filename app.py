@@ -402,105 +402,180 @@ with main_tab:
                 f"{effective_vehicles}/{num_vehicles} véhicule(s) réellement disponibles."
             )
 
+        # ----------------------------------------------------------------------------
+        # CORRECTIF (le système ne délivrait pas toutes les commandes) : CAUSE RACINE.
+        #
+        # Le composant React renvoie sa valeur à Python (via Streamlit.setComponentValue)
+        # à CHAQUE commande livrée — c'est ce mécanisme même qui permet de tenir
+        # `delivered_ids` à jour. Mais tout changement de la valeur renvoyée par un
+        # composant Streamlit déclenche AUTOMATIQUEMENT un rerun de tout le script.
+        #
+        # Or, sans le correctif ci-dessous, CE rerun recalculait `active_orders` (qui
+        # exclut désormais la commande livrée), puis relançait OR-Tools dessus — pour un
+        # ensemble de commandes différent, donc un NOUVEAU `structuralKey` côté React,
+        # donc un REMONTAGE COMPLET du composant. Résultat : à CHAQUE livraison, TOUS
+        # les camions (même ceux qui n'avaient rien livré) étaient réaffichés au dépôt et
+        # redémarraient leur tournée à zéro kilomètre parcouru. Sur une tournée à
+        # plusieurs arrêts, ce cycle recommençait avant même qu'un camion ait eu le temps
+        # de ré-accumuler assez de distance pour atteindre son (nouvel) premier arrêt —
+        # certaines commandes n'étaient donc, dans les faits, jamais livrées.
+        #
+        # `plan_signature` ne dépend QUE de ce qui doit réellement déclencher une
+        # replanification OR-Tools (arrivée d'une nouvelle commande, annulation, panne
+        # véhicule, changement de priorité, pénalité de trafic) — PAS du fait qu'une
+        # commande vient d'être livrée. `active_orders["id"] ∪ delivered_orders["id"]`
+        # est justement l'ensemble des commandes "déjà arrivées et non annulées" : il ne
+        # change PAS quand une commande passe simplement d'"active" à "livrée".
+        plan_signature = (
+            tuple(sorted(pd.concat([active_orders["id"], delivered_orders["id"]]))),
+            effective_vehicles,
+            tuple(sorted(st.session_state.priority_overrides.items())),
+            round(st.session_state.traffic_penalty, 3),
+        )
+        plan_cache = st.session_state.get("plan_cache")
+        reuse_cached_plan = plan_cache is not None and plan_cache["signature"] == plan_signature
+
+        total_demand = int(active_orders["demand_kg"].sum())
+
+        if reuse_cached_plan:
+            # Rejoue EXACTEMENT le même plan (mêmes tracés, mêmes arrêts) : le composant
+            # React ne remonte pas, les camions continuent leur tournée en cours sans
+            # interruption ni retour artificiel au dépôt — seule la commande livrée
+            # change de statut (calculé côté React lui-même, à partir de sa position).
+            coords_list = plan_cache["coords_list"]
+            raw_dist_matrix = plan_cache["raw_dist_matrix"]
+            plan_orders_df = plan_cache["plan_orders_df"]
+            truck_trips = plan_cache["truck_trips"]
+            optimized_routes = plan_cache["optimized_routes"]
+            total_trips = plan_cache["total_trips"]
+            multi_trip_trucks = plan_cache["multi_trip_trucks"]
+            virtual_vehicle_count = plan_cache["virtual_vehicle_count"]
+            total_capacity = plan_cache["total_capacity"]
+            optimized_distance_km = plan_cache["optimized_distance_km"]
+            baseline_distance_km = plan_cache["baseline_distance_km"]
+            gain_pct = plan_cache["gain_pct"]
+
         # GARDE-FOU EXPLICITE : on retire une seconde fois, juste avant de construire les
         # données envoyées au solveur, toute commande déjà livrée. Le filtre plus haut
         # (ligne "active_orders = non_cancelled_orders[...]") suffit en théorie, mais cette
         # étape est délibérément dupliquée ICI, au point d'entrée réel d'OR-Tools, pour
         # qu'aucune commande livrée ne puisse JAMAIS lui être transmise — même si une future
         # modification venait, par erreur, à casser ou contourner le filtre initial.
-        leaked_delivered = active_orders[active_orders["id"].isin(st.session_state.delivered_ids)]
-        if not leaked_delivered.empty:
-            # Ne devrait jamais arriver : on log l'anomalie plutôt que de planter, puis on
-            # retire quand même ces commandes avant l'appel à OR-Tools.
-            log_event(
-                f"⚠️ Anomalie interne : {len(leaked_delivered)} commande(s) déjà livrée(s) "
-                f"détectée(s) juste avant l'appel OR-Tools — retirées par sécurité."
-            )
-            active_orders = active_orders[
-                ~active_orders["id"].isin(st.session_state.delivered_ids)
-            ].reset_index(drop=True)
-
-        total_demand = int(active_orders["demand_kg"].sum())
-
-        if len(active_orders) > 0:
-            coords_list = [depot_coords] + list(zip(active_orders["lat"], active_orders["lon"]))
-            demands = [0] + active_orders["demand_kg"].astype(int).tolist()
-
-            # Nombre de rotations par camion calculé automatiquement à partir de la demande totale
-            # et de la capacité réellement disponible (plus besoin de régler un curseur manuel).
-            # +1 rotation de marge : laisse au solveur une capacité légèrement excédentaire pour
-            # répartir les tournées efficacement (sinon, avec le compte pile, il peut n'exister
-            # aucune répartition valide même quand la capacité totale suffit tout juste).
-            max_trips_per_vehicle = max(
-                1, math.ceil(total_demand / (effective_vehicles * vehicle_capacity)) + 1
-            )
-
-            # Le solveur reçoit des véhicules "virtuels" (camion physique x trajets max autorisés),
-            # tous de même capacité : ça lui permet de répartir une commande sur plusieurs rotations
-            # d'un même camion si la capacité en un seul passage ne suffit pas.
-            virtual_vehicle_count = effective_vehicles * max_trips_per_vehicle
-            vehicle_capacities = [vehicle_capacity] * virtual_vehicle_count
-
-            # ----------------------------------------------------------------------------
-            # 7. CALCUL DVRP (OSRM + OR-Tools, avec capacité, rotations et pénalité de trafic)
-            #    Relancé à chaque fois que l'ensemble des commandes "arrivées" change : une
-            #    livraison qui vient de se terminer (commande retirée du problème) ou une
-            #    nouvelle commande qui vient d'atteindre son release_time (commande ajoutée
-            #    au problème) déclenchent chacune une VRAIE replanification OR-Tools ici.
-            # ----------------------------------------------------------------------------
-            with st.spinner("Calcul des distances et optimisation des tournées..."):
-                raw_dist_matrix = get_osrm_distance_matrix(tuple(coords_list))  # distances réelles (km affichés)
-                solver_dist_matrix = raw_dist_matrix
-                if st.session_state.traffic_penalty > 1.0:
-                    # La pénalité de trafic influence UNIQUEMENT la décision d'OR-Tools (pour qu'il évite
-                    # la zone concernée) ; les distances affichées restent les vraies distances physiques.
-                    solver_dist_matrix = (np.array(raw_dist_matrix) * st.session_state.traffic_penalty).tolist()
-                virtual_routes = solve_dvrp_ortools(solver_dist_matrix, demands, vehicle_capacities)
-
-            total_capacity = vehicle_capacity * virtual_vehicle_count
-            if not virtual_routes:
-                st.error(
-                    f"⚠️ Aucune tournée réalisable : {total_demand} kg de commandes pour "
-                    f"{total_capacity} kg de capacité totale disponible ({effective_vehicles} véhicule(s) "
-                    f"x {max_trips_per_vehicle} rotation(s), calculées automatiquement). "
-                    f"Augmentez le nombre de véhicules ou leur capacité, ou réinitialisez les événements."
-                )
-                st.stop()
-
-            # Regroupe les tournées virtuelles en rotations successives par camion physique.
-            truck_trips = group_multi_trip_routes(virtual_routes, effective_vehicles)
-            optimized_routes = [route for trips in truck_trips.values() for route in trips]  # pour les KPI globaux
-            total_trips = len(optimized_routes)
-            multi_trip_trucks = sum(1 for trips in truck_trips.values() if len(trips) > 1)
-
-            # ----------------------------------------------------------------------------
-            # 7bis. PREUVE DE L'OPTIMISATION : distance réelle vs référence non optimisée
-            # ----------------------------------------------------------------------------
-            # On mesure la distance physique (raw_dist_matrix, sans la pénalité de trafic qui ne sert
-            # qu'à orienter le solveur) des tournées OR-Tools, et on la compare à une tournée « naïve »
-            # qui affecte les commandes dans leur ordre d'apparition, sans aucune optimisation.
-            optimized_distance_km = sum(route_distance(r, raw_dist_matrix) for r in optimized_routes) / 1000
-            baseline_routes = naive_baseline_routes(demands, vehicle_capacities)
-            baseline_distance_km = sum(route_distance(r, raw_dist_matrix) for r in baseline_routes) / 1000
-            gain_km = baseline_distance_km - optimized_distance_km
-            gain_pct = (gain_km / baseline_distance_km * 100) if baseline_distance_km > 0 else 0
+        # (Uniquement pertinent quand on recalcule réellement — pas en cas de réutilisation
+        # du plan mis en cache, ci-dessus.)
         else:
-            # Rien à router pour l'instant : soit tout est déjà livré, soit on attend l'arrivée
-            # de la prochaine commande (release_time pas encore atteint). On garde néanmoins
-            # l'interface active (carte + horloge) pour que le composant React continue de
-            # faire avancer le temps et puisse détecter l'arrivée de la prochaine commande,
-            # ce qui déclenchera alors une vraie replanification (voir plus bas).
-            coords_list = [depot_coords]
-            raw_dist_matrix = [[0.0]]
-            truck_trips = {}
-            optimized_routes = []
-            total_trips = 0
-            multi_trip_trucks = 0
-            virtual_vehicle_count = effective_vehicles
-            total_capacity = vehicle_capacity * effective_vehicles
-            optimized_distance_km = 0.0
-            baseline_distance_km = 0.0
-            gain_pct = 0.0
+            leaked_delivered = active_orders[active_orders["id"].isin(st.session_state.delivered_ids)]
+            if not leaked_delivered.empty:
+                # Ne devrait jamais arriver : on log l'anomalie plutôt que de planter, puis on
+                # retire quand même ces commandes avant l'appel à OR-Tools.
+                log_event(
+                    f"⚠️ Anomalie interne : {len(leaked_delivered)} commande(s) déjà livrée(s) "
+                    f"détectée(s) juste avant l'appel OR-Tools — retirées par sécurité."
+                )
+                active_orders = active_orders[
+                    ~active_orders["id"].isin(st.session_state.delivered_ids)
+                ].reset_index(drop=True)
+                total_demand = int(active_orders["demand_kg"].sum())
+
+            plan_orders_df = active_orders
+
+            if len(active_orders) > 0:
+                coords_list = [depot_coords] + list(zip(active_orders["lat"], active_orders["lon"]))
+                demands = [0] + active_orders["demand_kg"].astype(int).tolist()
+
+                # Nombre de rotations par camion calculé automatiquement à partir de la demande totale
+                # et de la capacité réellement disponible (plus besoin de régler un curseur manuel).
+                # +1 rotation de marge : laisse au solveur une capacité légèrement excédentaire pour
+                # répartir les tournées efficacement (sinon, avec le compte pile, il peut n'exister
+                # aucune répartition valide même quand la capacité totale suffit tout juste).
+                max_trips_per_vehicle = max(
+                    1, math.ceil(total_demand / (effective_vehicles * vehicle_capacity)) + 1
+                )
+
+                # Le solveur reçoit des véhicules "virtuels" (camion physique x trajets max autorisés),
+                # tous de même capacité : ça lui permet de répartir une commande sur plusieurs rotations
+                # d'un même camion si la capacité en un seul passage ne suffit pas.
+                virtual_vehicle_count = effective_vehicles * max_trips_per_vehicle
+                vehicle_capacities = [vehicle_capacity] * virtual_vehicle_count
+
+                # ----------------------------------------------------------------------------
+                # 7. CALCUL DVRP (OSRM + OR-Tools, avec capacité, rotations et pénalité de trafic)
+                #    Relancé uniquement quand `plan_signature` change réellement : une nouvelle
+                #    commande qui vient d'atteindre son release_time, une annulation, une panne
+                #    véhicule ou un changement de priorité — JAMAIS pour une simple livraison
+                #    (voir le correctif "CAUSE RACINE" plus haut).
+                # ----------------------------------------------------------------------------
+                with st.spinner("Calcul des distances et optimisation des tournées..."):
+                    raw_dist_matrix = get_osrm_distance_matrix(tuple(coords_list))  # distances réelles (km affichés)
+                    solver_dist_matrix = raw_dist_matrix
+                    if st.session_state.traffic_penalty > 1.0:
+                        # La pénalité de trafic influence UNIQUEMENT la décision d'OR-Tools (pour qu'il évite
+                        # la zone concernée) ; les distances affichées restent les vraies distances physiques.
+                        solver_dist_matrix = (np.array(raw_dist_matrix) * st.session_state.traffic_penalty).tolist()
+                    virtual_routes = solve_dvrp_ortools(solver_dist_matrix, demands, vehicle_capacities)
+
+                total_capacity = vehicle_capacity * virtual_vehicle_count
+                if not virtual_routes:
+                    st.error(
+                        f"⚠️ Aucune tournée réalisable : {total_demand} kg de commandes pour "
+                        f"{total_capacity} kg de capacité totale disponible ({effective_vehicles} véhicule(s) "
+                        f"x {max_trips_per_vehicle} rotation(s), calculées automatiquement). "
+                        f"Augmentez le nombre de véhicules ou leur capacité, ou réinitialisez les événements."
+                    )
+                    st.stop()
+
+                # Regroupe les tournées virtuelles en rotations successives par camion physique.
+                truck_trips = group_multi_trip_routes(virtual_routes, effective_vehicles)
+                optimized_routes = [route for trips in truck_trips.values() for route in trips]  # pour les KPI globaux
+                total_trips = len(optimized_routes)
+                multi_trip_trucks = sum(1 for trips in truck_trips.values() if len(trips) > 1)
+
+                # ----------------------------------------------------------------------------
+                # 7bis. PREUVE DE L'OPTIMISATION : distance réelle vs référence non optimisée
+                # ----------------------------------------------------------------------------
+                # On mesure la distance physique (raw_dist_matrix, sans la pénalité de trafic qui ne sert
+                # qu'à orienter le solveur) des tournées OR-Tools, et on la compare à une tournée « naïve »
+                # qui affecte les commandes dans leur ordre d'apparition, sans aucune optimisation.
+                optimized_distance_km = sum(route_distance(r, raw_dist_matrix) for r in optimized_routes) / 1000
+                baseline_routes = naive_baseline_routes(demands, vehicle_capacities)
+                baseline_distance_km = sum(route_distance(r, raw_dist_matrix) for r in baseline_routes) / 1000
+                gain_km = baseline_distance_km - optimized_distance_km
+                gain_pct = (gain_km / baseline_distance_km * 100) if baseline_distance_km > 0 else 0
+            else:
+                # Rien à router pour l'instant : soit tout est déjà livré, soit on attend l'arrivée
+                # de la prochaine commande (release_time pas encore atteint). On garde néanmoins
+                # l'interface active (carte + horloge) pour que le composant React continue de
+                # faire avancer le temps et puisse détecter l'arrivée de la prochaine commande,
+                # ce qui déclenchera alors une vraie replanification (voir plus bas).
+                coords_list = [depot_coords]
+                raw_dist_matrix = [[0.0]]
+                truck_trips = {}
+                optimized_routes = []
+                total_trips = 0
+                multi_trip_trucks = 0
+                virtual_vehicle_count = effective_vehicles
+                total_capacity = vehicle_capacity * effective_vehicles
+                optimized_distance_km = 0.0
+                baseline_distance_km = 0.0
+                gain_pct = 0.0
+
+            # Plan fraîchement calculé : on le met en cache, gardé jusqu'à ce que
+            # `plan_signature` change réellement (voir plus haut).
+            st.session_state.plan_cache = {
+                "signature": plan_signature,
+                "coords_list": coords_list,
+                "raw_dist_matrix": raw_dist_matrix,
+                "plan_orders_df": plan_orders_df,
+                "truck_trips": truck_trips,
+                "optimized_routes": optimized_routes,
+                "total_trips": total_trips,
+                "multi_trip_trucks": multi_trip_trucks,
+                "virtual_vehicle_count": virtual_vehicle_count,
+                "total_capacity": total_capacity,
+                "optimized_distance_km": optimized_distance_km,
+                "baseline_distance_km": baseline_distance_km,
+                "gain_pct": gain_pct,
+            }
 
         # ----------------------------------------------------------------------------
         # 8. INDICATEURS STATIQUES (ne changent pas avec le temps simulé — donc Python
@@ -579,7 +654,7 @@ with main_tab:
                         cum_km += raw_dist_matrix[route[i]][route[i + 1]] / 1000
                         node = route[i + 1]
                         if node != 0:
-                            stops.append({"order_id": active_orders.iloc[node - 1]["id"], "cum_km": cum_km})
+                            stops.append({"order_id": plan_orders_df.iloc[node - 1]["id"], "cum_km": cum_km})
 
                 trucks_payload.append({
                     "label": f"V{p_idx + 1}", "color": color, "used": True,
@@ -726,7 +801,7 @@ with main_tab:
             for p_idx, trips in truck_trips.items():
                 truck_total_km = sum(route_distance(r, raw_dist_matrix) for r in trips) / 1000
                 truck_total_load = sum(
-                    active_orders.iloc[node - 1]["demand_kg"] for r in trips for node in r if node != 0
+                    plan_orders_df.iloc[node - 1]["demand_kg"] for r in trips for node in r if node != 0
                 )
                 header = f"**Camion V{p_idx + 1}**"
                 if len(trips) > 1:
@@ -735,8 +810,8 @@ with main_tab:
                     header += f" — {truck_total_load}/{vehicle_capacity} kg — {truck_total_km:.1f} km"
                 st.markdown(header)
                 for t_idx, route in enumerate(trips):
-                    stops_names = [active_orders.iloc[node - 1]["client"] for node in route if node != 0]
-                    load = sum(active_orders.iloc[node - 1]["demand_kg"] for node in route if node != 0)
+                    stops_names = [plan_orders_df.iloc[node - 1]["client"] for node in route if node != 0]
+                    load = sum(plan_orders_df.iloc[node - 1]["demand_kg"] for node in route if node != 0)
                     trip_km = route_distance(route, raw_dist_matrix) / 1000
                     prefix = f"Trajet {t_idx + 1}/{len(trips)} " if len(trips) > 1 else ""
                     st.caption(
@@ -761,24 +836,18 @@ with main_tab:
 
 
 # ==============================================================================
-# 📊 ONGLET COMPARATIF — démontrer la valeur ajoutée du dynamisme + du tracking
+# 📊 ONGLET COMPARATIF — l'apport concret du tracking en temps réel
 # ==============================================================================
 # Principe : rejouer EXACTEMENT le même scénario (mêmes commandes, mêmes imprévus,
-# aux mêmes instants) sous 3 niveaux d'information différents, puis comparer ce que
-# chaque mode a réellement pu prendre en compte dans le plan qu'il exécute :
-#   - 🧊 Statique : calcule une fois à t=0 et n'observe plus jamais rien ensuite.
-#   - 🔄 Sans tracking : ne "voit" les événements qu'à des points de contrôle
-#     espacés (ex. toutes les 25 min) — d'où un délai de réaction.
-#   - 📡 Avec tracking : réagit quasi immédiatement à chaque événement (délai =
-#     temps de calcul OR-Tools, de l'ordre de la minute).
-# Les distances affichées sont de VRAIS calculs OR-Tools sur des sous-ensembles
-# réels du jeu de données choisi dans la barre latérale — seul le déroulé temporel
-# des événements (instants, fréquence des points de contrôle) est un scénario
-# pédagogique simplifié et déterministe (graine fixe), assumé et expliqué comme tel.
+# aux mêmes instants) une fois SANS tracking GPS et une fois AVEC, puis montrer
+# simplement la différence que ça fait. Les distances affichées sont de VRAIS
+# calculs OR-Tools sur des sous-ensembles réels du jeu de données choisi dans la
+# barre latérale — seul le déroulé temporel des imprévus (instants, fréquence des
+# points de contrôle) est un scénario pédagogique simplifié et déterministe.
 def _comparative_scenario_events(df_orders_full: pd.DataFrame, seed: int = 42):
     """Scénario déterministe : ~30 % des commandes n'arrivent qu'en cours de route,
     un camion tombe en panne, 2 commandes sont annulées — toujours les mêmes (graine
-    fixe), pour que la comparaison soit reproductible et équitable entre les 3 modes."""
+    fixe), pour que la comparaison soit reproductible et équitable entre les deux modes."""
     rng = np.random.default_rng(seed)
     order_ids = df_orders_full["id"].tolist()
     n = len(order_ids)
@@ -824,16 +893,12 @@ def _solve_plan_km(df_subset: pd.DataFrame, depot, vehicles_available: int, capa
 
 
 def render_comparative_tab():
-    st.subheader("📊 Un même scénario, trois niveaux d'information")
+    st.subheader("📊 Sans tracking, ou avec tracking : quelle différence ?")
     st.markdown(
-        "Le **même jeu de commandes** (celui sélectionné dans la barre latérale) et le "
-        "**même déroulé d'imprévus** — une partie des commandes n'arrive qu'en cours de "
-        "route, un camion tombe en panne, deux commandes sont annulées — est rejoué dans "
-        "les 3 modes. Seule change **la rapidité avec laquelle chaque mode en a "
-        "connaissance**. Les distances sont de vrais calculs OR-Tools ; le déroulé des "
-        "événements (instants, fréquence des points de contrôle) est un scénario "
-        "pédagogique simplifié et déterministe, pour que la comparaison soit "
-        "reproductible."
+        "On rejoue **le même scénario** — mêmes commandes, mêmes imprévus (nouvelles "
+        "commandes en cours de route, panne d'un camion, annulations) — une fois **sans** "
+        "suivi GPS, une fois **avec**. Les distances sont de vrais calculs OR-Tools ; seul "
+        "le moment où chaque mode apprend la nouvelle change."
     )
 
     if st.button("▶️ Lancer la comparaison", type="primary"):
@@ -841,27 +906,22 @@ def render_comparative_tab():
         st.session_state["_comp_signature"] = None  # force un recalcul
 
     if not st.session_state.get("_comp_run"):
-        st.info("Cliquez sur **« Lancer la comparaison »** pour exécuter le scénario dans les 3 modes.")
+        st.info("👉 Cliquez sur **« Lancer la comparaison »** pour voir la différence, chiffres à l'appui.")
         return
 
     initial_ids, new_order_ids, cancelled_ids, events = _comparative_scenario_events(df_orders)
     initial_df = df_orders[df_orders["id"].isin(initial_ids)].reset_index(drop=True)
 
     # Recalcule uniquement si les paramètres pertinents (dataset, flotte, capacité) ont
-    # changé depuis la dernière exécution — évite de relancer OR-Tools à chaque interaction
-    # sans rapport (ex : ouvrir un expander) dans les autres onglets.
+    # changé depuis la dernière exécution.
     signature = (dataset_choice, num_vehicles, vehicle_capacity, len(df_orders))
     if st.session_state.get("_comp_signature") != signature:
-        with st.spinner("Résolution OR-Tools pour les 3 modes (quelques secondes)..."):
-            # 🧊 STATIQUE : ne connaît QUE l'état initial, avec la flotte "nominale" (elle
-            # ignore la panne, puisqu'elle n'observe plus jamais rien après t=0).
-            static_dist, static_trips = _solve_plan_km(initial_df, depot_coords, num_vehicles, vehicle_capacity)
-
+        with st.spinner("Calcul des deux scénarios (quelques secondes)..."):
             # 🔄 SANS TRACKING : points de contrôle toutes les 25 min → capte la nouvelle
-            # commande (survenue à t=10) au 1er contrôle (t=25, soit 15 min de retard), et
-            # la panne (survenue à t=30) au 2e contrôle (t=50, soit 20 min de retard).
-            # L'annulation (t=55) survient APRÈS le dernier contrôle observé dans la
-            # fenêtre (t=50) : elle n'est donc pas encore prise en compte.
+            # commande (survenue à t=10) au 1er contrôle (t=25, 15 min de retard), et la
+            # panne (survenue à t=30) au 2e contrôle (t=50, 20 min de retard). L'annulation
+            # (t=55) survient après le dernier contrôle observé dans la fenêtre : pas
+            # encore prise en compte.
             no_track_df = pd.concat(
                 [initial_df, df_orders[df_orders["id"].isin(new_order_ids)]], ignore_index=True
             )
@@ -870,11 +930,10 @@ def render_comparative_tab():
                 no_track_df, depot_coords, no_track_vehicles, vehicle_capacity
             )
             no_track_reaction_delays = [25 - 10, 50 - 30]
-            no_track_events_seen = 1 + (1 if new_order_ids else 0)  # panne + nouvelle commande
+            no_track_events_seen = 1 + (1 if new_order_ids else 0)
 
             # 📡 AVEC TRACKING : réagit à chaque événement quasi immédiatement (délai =
-            # temps de calcul OR-Tools, de l'ordre de la minute) — les 3 événements sont
-            # donc déjà intégrés dans le plan exécuté au sein de la même fenêtre.
+            # temps de calcul OR-Tools, de l'ordre de la minute).
             tracking_df = pd.concat(
                 [initial_df, df_orders[df_orders["id"].isin(new_order_ids)]], ignore_index=True
             )
@@ -887,7 +946,6 @@ def render_comparative_tab():
 
         st.session_state["_comp_signature"] = signature
         st.session_state["_comp_results"] = dict(
-            static_dist=static_dist, static_trips=static_trips,
             no_track_dist=no_track_dist, no_track_trips=no_track_trips,
             no_track_reaction_delays=no_track_reaction_delays, no_track_events_seen=no_track_events_seen,
             tracking_dist=tracking_dist, tracking_trips=tracking_trips,
@@ -895,73 +953,65 @@ def render_comparative_tab():
         )
 
     r = st.session_state["_comp_results"]
+    avg_delay_no_track = float(np.mean(r["no_track_reaction_delays"]))
+    avg_delay_tracking = float(np.mean(r["tracking_reaction_delays"]))
+    events_missed_no_track = len(events) - r["no_track_events_seen"]
 
     def _fmt_km(v):
-        return f"{v:.1f} km" if v is not None else "❌ aucune solution (capacité insuffisante)"
+        return f"{v:.1f} km" if v is not None else "❌ pas de solution"
 
-    st.markdown("### 🏁 Résultats — fenêtre d'observation de 60 minutes simulées")
-    df_compare = pd.DataFrame([
-        {
-            "Mode": "🧊 Statique",
-            "Distance du plan réellement exécuté": _fmt_km(r["static_dist"]),
-            "Événements pris en compte": f"0 / {len(events)}",
-            "Délai de réaction moyen": "∞ (jamais)",
-            "Replanifications déclenchées": 1,
-        },
-        {
-            "Mode": "🔄 Dynamique sans tracking",
-            "Distance du plan réellement exécuté": _fmt_km(r["no_track_dist"]),
-            "Événements pris en compte": f"{r['no_track_events_seen']} / {len(events)}",
-            "Délai de réaction moyen": f"{np.mean(r['no_track_reaction_delays']):.0f} min",
-            "Replanifications déclenchées": 2,
-        },
-        {
-            "Mode": "📡 Dynamique avec tracking",
-            "Distance du plan réellement exécuté": _fmt_km(r["tracking_dist"]),
-            "Événements pris en compte": f"{len(events)} / {len(events)}",
-            "Délai de réaction moyen": f"{np.mean(r['tracking_reaction_delays']):.0f} min",
-            "Replanifications déclenchées": len(events),
-        },
-    ])
-    st.dataframe(df_compare, hide_index=True, width="stretch")
+    # ---------------------------------------------------------------- Verdict
+    st.markdown("### 🏆 En un coup d'œil")
+    v1, v2, v3 = st.columns(3)
+    v1.metric("⚡ Réaction plus rapide", f"{avg_delay_no_track - avg_delay_tracking:.0f} min gagnées")
+    v2.metric("📋 Imprévus mieux gérés", f"+{events_missed_no_track} pris en compte")
+    if r["no_track_dist"] is not None and r["tracking_dist"] is not None:
+        v3.metric("📏 Écart sur la distance exécutée", f"{abs(r['tracking_dist'] - r['no_track_dist']):.1f} km")
+    else:
+        v3.metric("📏 Écart sur la distance exécutée", "—")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("📏 Distance — Statique", _fmt_km(r["static_dist"]))
-    delta2 = (f"{r['no_track_dist'] - r['static_dist']:+.1f} km vs statique"
-              if r["no_track_dist"] is not None and r["static_dist"] is not None else None)
-    c2.metric("📏 Distance — Sans tracking", _fmt_km(r["no_track_dist"]), delta=delta2, delta_color="off")
-    delta3 = (f"{r['tracking_dist'] - r['no_track_dist']:+.1f} km vs sans tracking"
-              if r["tracking_dist"] is not None and r["no_track_dist"] is not None else None)
-    c3.metric("📏 Distance — Avec tracking", _fmt_km(r["tracking_dist"]), delta=delta3, delta_color="off")
+    st.markdown("")
+
+    # ---------------------------------------------------------- Deux cartes
+    col1, col2 = st.columns(2)
+    with col1:
+        with st.container(border=True):
+            st.markdown("#### 🔄 Sans tracking")
+            st.metric("Distance exécutée", _fmt_km(r["no_track_dist"]))
+            st.metric("Délai de réaction moyen", f"{avg_delay_no_track:.0f} min")
+            st.metric("Imprévus pris en compte", f"{r['no_track_events_seen']} / {len(events)}")
+            st.markdown("**Ce qui a été raté :**")
+            if new_order_ids:
+                st.write(f"✅ Nouvelle(s) commande(s) intégrée(s), mais avec **{r['no_track_reaction_delays'][0]} min** de retard")
+            st.write(f"✅ Panne détectée, avec **{r['no_track_reaction_delays'][1]} min** de retard")
+            if cancelled_ids:
+                st.write(f"❌ {len(cancelled_ids)} annulation(s) pas encore prise(s) en compte dans la fenêtre observée")
+    with col2:
+        with st.container(border=True):
+            st.markdown("#### 📡 Avec tracking")
+            st.metric("Distance exécutée", _fmt_km(r["tracking_dist"]))
+            st.metric("Délai de réaction moyen", f"{avg_delay_tracking:.0f} min")
+            st.metric("Imprévus pris en compte", f"{len(events)} / {len(events)}")
+            st.markdown("**Résultat :**")
+            if new_order_ids:
+                st.write("✅ Nouvelle(s) commande(s) intégrée(s) quasi immédiatement (~1 min)")
+            st.write("✅ Panne détectée et compensée en quelques secondes")
+            if cancelled_ids:
+                st.write(f"✅ {len(cancelled_ids)} annulation(s) déjà retirée(s) du plan")
+
+    # ---------------------------------------------------------- Graphique
+    st.markdown("### ⏱️ Délai de réaction face à un imprévu")
+    chart_df = pd.DataFrame({
+        "Mode": ["🔄 Sans tracking", "📡 Avec tracking"],
+        "Minutes de retard": [avg_delay_no_track, avg_delay_tracking],
+    }).set_index("Mode")
+    st.bar_chart(chart_df, height=220)
     st.caption(
-        "La distance n'est pas directement comparable terme à terme (chaque mode route un "
-        "ensemble de commandes différent, reflet de ce qu'il savait au moment d'agir) — "
-        "l'indicateur clé est plutôt le nombre d'événements réellement pris en compte "
-        "et le délai de réaction, ci-dessus."
+        "La distance n'est qu'un indicateur secondaire ici (chaque mode route un "
+        "ensemble de commandes légèrement différent, reflet de ce qu'il savait au "
+        "moment d'agir) : l'écart qui compte vraiment est ce graphique — la rapidité "
+        "à réagir à un imprévu."
     )
-
-    st.markdown("### 🔍 Ce que chaque mode a raté (ou pas)")
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.error("🧊 **Statique**")
-        st.write(f"❌ {len(new_order_ids)} nouvelle(s) commande(s) jamais intégrée(s) au plan")
-        if cancelled_ids:
-            st.write(f"❌ {len(cancelled_ids)} commande(s) annulée(s) mais toujours dans la tournée")
-        st.write("❌ Panne du camion ignorée — plan invalide en pratique")
-    with colB:
-        st.warning("🔄 **Sans tracking**")
-        if new_order_ids:
-            st.write(f"✅ Nouvelle(s) commande(s) intégrée(s), avec **{r['no_track_reaction_delays'][0]} min** de retard")
-        st.write(f"✅ Panne détectée, avec **{r['no_track_reaction_delays'][1]} min** de retard")
-        if cancelled_ids:
-            st.write(f"❌ {len(cancelled_ids)} annulation(s) pas encore prise(s) en compte dans la fenêtre observée")
-    with colC:
-        st.success("📡 **Avec tracking**")
-        if new_order_ids:
-            st.write(f"✅ Nouvelle(s) commande(s) intégrée(s) quasi immédiatement (~1 min)")
-        st.write("✅ Panne détectée et compensée en quelques secondes")
-        if cancelled_ids:
-            st.write(f"✅ {len(cancelled_ids)} annulation(s) déjà retirée(s) du plan")
 
     st.caption(
         "⚠️ Scénario pédagogique déterministe (graine fixe) construit à partir du jeu de "
