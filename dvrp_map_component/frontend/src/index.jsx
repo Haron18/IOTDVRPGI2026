@@ -4,8 +4,12 @@ import { Streamlit, withStreamlitConnection } from "streamlit-component-lib";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-const PRIORITY_COLOR = { URGENTE: "red", HAUTE: "orange", NORMALE: "blue" };
+const PRIORITY_COLOR = { URGENTE: "#e53935", HAUTE: "#fb8c00", NORMALE: "#1e88e5" };
 const PRIORITY_LABEL = { URGENTE: "🔴 Urgente", HAUTE: "🟠 Haute", NORMALE: "🔵 Normale" };
+// Rayon des marqueurs commande sur la carte : les priorités élevées sont plus visibles.
+const PRIORITY_RADIUS = { URGENTE: 11, HAUTE: 9.5, NORMALE: 7 };
+// Priorités considérées comme "à surveiller" pour le suivi urgent/haute importance.
+const HIGH_PRIORITIES = new Set(["URGENTE", "HAUTE"]);
 
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371.0;
@@ -90,6 +94,9 @@ function DvrpMap({ args }) {
   const mapRef = useRef(null);
   const truckStateRef = useRef({});
   const orderMarkersRef = useRef({});
+  // id de commande -> priorité, reconstruit à chaque changement structurel — utilisé
+  // dans la boucle d'animation pour le suivi urgent/haute importance par tournée.
+  const orderPriorityRef = useRef({});
   const lastReportedRef = useRef(null);
   // Référence "légère" pour l'horloge : mise à jour SANS reconstruire la carte (voir
   // plus bas). Sépare ce qui doit reconstruire visuellement la carte (itinéraires
@@ -109,6 +116,11 @@ function DvrpMap({ args }) {
     deliveredIds: alreadyDeliveredIds,
     distanceParcourue: alreadyTraveledKm,
     allFinished: false,
+    // Suivi urgent/haute importance : commandes prioritaires encore en attente de
+    // livraison, et détail par camion (tournée) pour repérer d'un coup d'œil quelle
+    // tournée transporte des commandes sensibles.
+    highPriorityPending: [],
+    truckPriorityCounts: {},
   });
 
   // Clé structurelle : ne change QUE si les itinéraires (tracés, camions utilisés,
@@ -152,16 +164,48 @@ function DvrpMap({ args }) {
       .addTo(map)
       .bindPopup("<b>Dépôt Central — Oued Smar</b>");
 
+    // Légende des priorités — repère visuel permanent pour distinguer les commandes
+    // urgentes / haute importance des commandes normales sur la carte.
+    const legend = L.control({ position: "bottomright" });
+    legend.onAdd = () => {
+      const div = L.DomUtil.create("div", "dvrp-legend");
+      div.innerHTML = ["URGENTE", "HAUTE", "NORMALE"]
+        .map(
+          (p) =>
+            '<div class="dvrp-legend-row"><span class="dvrp-legend-dot" style="background:' +
+            PRIORITY_COLOR[p] + '"></span>' + PRIORITY_LABEL[p] + "</div>"
+        )
+        .join("");
+      return div;
+    };
+    legend.addTo(map);
+
     const orderMarkers = {};
+    orderPriorityRef.current = Object.fromEntries(orders.map((o) => [o.id, o.priority]));
     orders.forEach((o) => {
-      const color = PRIORITY_COLOR[o.priority] || "blue";
+      const color = PRIORITY_COLOR[o.priority] || PRIORITY_COLOR.NORMALE;
+      const isHighPriority = HIGH_PRIORITIES.has(o.priority);
+      const radius = PRIORITY_RADIUS[o.priority] || PRIORITY_RADIUS.NORMALE;
+
+      // Halo pulsant derrière le marqueur, uniquement pour URGENTE/HAUTE — permet de
+      // repérer ces commandes en un coup d'œil sur la carte, même à faible zoom.
+      let haloMarker = null;
+      if (isHighPriority) {
+        haloMarker = L.circleMarker([o.lat, o.lon], {
+          radius: radius + 6, color, fillColor: color, fillOpacity: 0.25,
+          weight: 0, className: "dvrp-priority-halo",
+        });
+      }
+
       const marker = L.circleMarker([o.lat, o.lon], {
-        radius: 8, color, fillColor: color, fillOpacity: 0.85, weight: 2,
+        radius, color, fillColor: color, fillOpacity: 0.9,
+        weight: isHighPriority ? 3 : 2,
       }).bindPopup(
-        "<b>" + o.client + "</b><br>Charge: " + o.demand_kg + " kg<br>" +
+        "<b>" + o.client + "</b><br>" + (PRIORITY_LABEL[o.priority] || o.priority) + "<br>" +
+          "Charge: " + o.demand_kg + " kg<br>" +
           "Temp. max: " + o.temp_max + "°C<br>Fenêtre: " + o.time_window
-      ).bindTooltip(o.id);
-      orderMarkers[o.id] = { marker, shown: false };
+      ).bindTooltip(o.id + (isHighPriority ? " ⚠️" : ""));
+      orderMarkers[o.id] = { marker, haloMarker, shown: false };
     });
     orderMarkersRef.current = orderMarkers;
 
@@ -208,9 +252,11 @@ function DvrpMap({ args }) {
         if (!entry) return;
         const shouldShow = o.release_time <= simClockMin;
         if (shouldShow && !entry.shown) {
+          if (entry.haloMarker) entry.haloMarker.addTo(map);
           entry.marker.addTo(map);
           entry.shown = true;
         } else if (!shouldShow && entry.shown) {
+          if (entry.haloMarker) entry.haloMarker.remove();
           entry.marker.remove();
           entry.shown = false;
         }
@@ -236,6 +282,31 @@ function DvrpMap({ args }) {
           if (traveledKm >= stop.cum_km) deliveredSet.add(stop.order_id);
         });
       });
+      // Suivi urgent/haute importance PAR TOURNÉE : pour chaque camion, on compte les
+      // arrêts prioritaires (URGENTE/HAUTE) pas encore livrés dans SA tournée — c'est
+      // ce qui permet d'afficher "V2 : 2 commandes urgentes en cours" dans le panneau
+      // dédié ci-dessous, sans dépendre d'un recalcul Python.
+      const truckPriorityCounts = {};
+      Object.entries(truckStateRef.current).forEach(([label, s]) => {
+        if (!s.used) return;
+        const traveledKm = Math.min(s.totalKm, (s.speedKmh * (simClockMin - baseMin)) / 60);
+        const pending = s.stops.filter(
+          (stop) =>
+            traveledKm < stop.cum_km &&
+            HIGH_PRIORITIES.has(orderPriorityRef.current[stop.order_id])
+        ).length;
+        if (pending > 0) truckPriorityCounts[label] = pending;
+      });
+
+      // Suivi urgent/haute importance GLOBAL : commandes déjà apparues, prioritaires,
+      // et pas encore livrées — toutes tournées confondues (pour la carte / le KPI).
+      const highPriorityPending = orders.filter(
+        (o) =>
+          o.release_time <= simClockMin &&
+          HIGH_PRIORITIES.has(o.priority) &&
+          !deliveredSet.has(o.id)
+      );
+
       // CORRECTIF (distance parcourue erronée) : `segmentDistanceKm` seul ne
       // mesurait que la distance parcourue DEPUIS LE DERNIER RECALCUL OR-TOOLS,
       // pas depuis le début de la simulation — puisqu'un recalcul (à chaque
@@ -252,6 +323,7 @@ function DvrpMap({ args }) {
         setKpi({
           simClockMin, visibleCount, totalOrders: orders.length,
           deliveredIds, distanceParcourue, allFinished: allUsedFinished,
+          highPriorityPending, truckPriorityCounts,
         });
         // `visibleCount` dans la clé : toute nouvelle commande qui "arrive" (release_time
         // atteint) déclenche aussitôt un retour vers Python, qui relance alors une
@@ -341,7 +413,23 @@ function DvrpMap({ args }) {
         ".dvrp-table th, .dvrp-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #f3f3f3; }" +
         ".dvrp-table th { position: sticky; top: 0; background: #fafbfc; font-weight: 600; color: #555; }" +
         ".dvrp-table tr:hover td { background: #fafbfc; }" +
-        ".dvrp-empty { padding: 14px; text-align: center; color: #999; font-size: 13px; }"
+        ".dvrp-empty { padding: 14px; text-align: center; color: #999; font-size: 13px; }" +
+        ".dvrp-kpi-card.dvrp-kpi-alert { background: #fff3ef; border-color: #ffd0bf; }" +
+        ".dvrp-kpi-card.dvrp-kpi-alert .dvrp-kpi-value { color: #d84315; }" +
+        ".dvrp-priority-panel { margin-top: 10px; background: #fff8f5; border: 1px solid #ffe0d0;" +
+        "  border-radius: 10px; padding: 10px 14px; }" +
+        ".dvrp-priority-panel-title { font-size: 12px; font-weight: 650; color: #b34700; margin-bottom: 6px; }" +
+        ".dvrp-priority-chips { display: flex; flex-wrap: wrap; gap: 8px; }" +
+        ".dvrp-priority-chip { font-size: 12.5px; background: #fff; border: 1px solid #ffd0b8;" +
+        "  border-radius: 20px; padding: 4px 10px; color: #333; }" +
+        ".dvrp-row-urgente td { background: #fdecea; }" +
+        ".dvrp-row-haute td { background: #fff4e5; }" +
+        ".dvrp-legend { background: rgba(255,255,255,.92); padding: 8px 10px; border-radius: 8px;" +
+        "  box-shadow: 0 1px 4px rgba(0,0,0,.2); font-size: 12px; line-height: 1.6; }" +
+        ".dvrp-legend-row { display: flex; align-items: center; gap: 6px; }" +
+        ".dvrp-legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }" +
+        ".dvrp-priority-halo { animation: dvrp-pulse 1.4s ease-in-out infinite; }" +
+        "@keyframes dvrp-pulse { 0% { opacity: .55; } 50% { opacity: .1; } 100% { opacity: .55; } }"
       }</style>
 
       <div ref={mapContainerRef} className="dvrp-map-box"
@@ -372,7 +460,25 @@ function DvrpMap({ args }) {
           <div className="dvrp-kpi-label">🚛 Camions en tournée</div>
           <div className="dvrp-kpi-value">{numVehiclesUsed} / {numVehiclesTotal}</div>
         </div>
+        <div className={"dvrp-kpi-card" + (kpi.highPriorityPending.length > 0 ? " dvrp-kpi-alert" : "")}>
+          <div className="dvrp-kpi-label">⚠️ Prioritaires en attente</div>
+          <div className="dvrp-kpi-value">{kpi.highPriorityPending.length}</div>
+          <div className="dvrp-kpi-sub">Urgentes + haute importance</div>
+        </div>
       </div>
+
+      {Object.keys(kpi.truckPriorityCounts).length > 0 && (
+        <div className="dvrp-priority-panel">
+          <div className="dvrp-priority-panel-title">📦 Suivi par tournée — commandes prioritaires en cours</div>
+          <div className="dvrp-priority-chips">
+            {Object.entries(kpi.truckPriorityCounts).map(([label, count]) => (
+              <span key={label} className="dvrp-priority-chip">
+                🚚 {label} · <b>{count}</b> {count > 1 ? "commandes" : "commande"} prioritaire{count > 1 ? "s" : ""}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {kpi.allFinished ? (
         <div className="dvrp-final done">
@@ -400,7 +506,14 @@ function DvrpMap({ args }) {
             </thead>
             <tbody>
               {tableRows.map((r) => (
-                <tr key={r.id}>
+                <tr
+                  key={r.id}
+                  className={
+                    r.priority === "URGENTE" ? "dvrp-row-urgente"
+                      : r.priority === "HAUTE" ? "dvrp-row-haute"
+                      : ""
+                  }
+                >
                   <td>{r.id}</td><td>{r.client}</td><td>{r.demand_kg}</td>
                   <td>{PRIORITY_LABEL[r.priority] || r.priority}</td><td>{r.status}</td>
                 </tr>
