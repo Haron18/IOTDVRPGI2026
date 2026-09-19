@@ -783,14 +783,24 @@ with main_tab:
                     st.session_state.sim_clock_min = max(st.session_state.sim_clock_min, arrival_clock)
                     log_event(f"🆕 Commande {new_arrival_id} arrivée → replanification de l'itinéraire.")
                     st.rerun()
-                # Arrêt automatique de la simulation temps réel dès que toutes les livraisons
-                # sont terminées (le composant React le signale via all_finished). On ne peut
-                # pas modifier auto_run_active ici directement (le toggle est déjà instancié
-                # dans CE run) : on passe par stop_requested, appliqué au tout début du
-                # prochain run. Protégé par la vérification de auto_run_active pour ne
-                # déclencher ce rerun qu'une seule fois (pas de boucle infinie une fois arrêté).
-                elif result.get("all_finished") and st.session_state.auto_run_active:
+                # Arrêt automatique dès que toutes les livraisons sont terminées (le composant
+                # React le signale via all_finished). On ne peut pas modifier auto_run_active
+                # ici directement (le toggle est déjà instancié dans CE run) : on passe par
+                # stop_requested, appliqué au tout début du prochain run.
+                #
+                # CORRECTIF (le bouton "🚀 Démarrer" ne réapparaissait jamais, l'horloge et le
+                # kilométrage semblaient "ne jamais s'arrêter") : deux bugs corrigés ensemble —
+                # (1) cette branche ne se déclenchait qu'en mode "temps réel" (auto_run_active),
+                # jamais après une progression manuelle via "+10 min" ; (2) même quand elle se
+                # déclenchait, elle ne remettait PAS `simulation_started` à False, donc le
+                # bouton rouge "🚀 Démarrer la simulation" restait caché et "⏹️ Arrêter" /
+                # "➡️ +10 min" restaient actifs indéfiniment après la fin réelle de la tournée.
+                # (Le vrai blocage en amont — `all_finished` jamais reçu à `true` par manque
+                # de camions "used" après la toute dernière livraison — est corrigé côté
+                # composant React, voir le correctif "CAUSE RACINE" dans index.jsx.)
+                elif result.get("all_finished") and st.session_state.simulation_started:
                     st.session_state.stop_requested = True
+                    st.session_state.simulation_started = False  # fait réapparaître "🚀 Démarrer"
                     log_event("⏹️ Simulation arrêtée automatiquement — toutes les livraisons sont terminées.")
                     st.rerun()
 

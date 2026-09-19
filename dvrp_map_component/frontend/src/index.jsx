@@ -299,6 +299,29 @@ function DvrpMap({ args }) {
           if (traveledKm >= stop.cum_km) deliveredSet.add(stop.order_id);
         });
       });
+
+      // CORRECTIF (l'horloge/le kilométrage ne s'arrêtaient jamais automatiquement) :
+      // CAUSE RACINE. Dès que la TOUTE DERNIÈRE commande active est livrée, Python
+      // recalcule aussitôt (rerun automatique déclenché par le simple changement de
+      // `delivered_ids`) — `active_orders` devient alors vide, donc plus AUCUNE tournée
+      // à planifier, donc `trucks_payload` ne contient plus que des camions "used: false".
+      // Ce nouveau `structuralKey` REMONTE le composant AVANT même que le dernier camion
+      // ait eu le temps de finir visuellement son trajet retour au dépôt.
+      //
+      // Au remontage, `usedCount` vaut donc 0 — et l'ancienne condition
+      // `allUsedFinished = usedCount > 0` restait alors bloquée à `false` POUR TOUJOURS
+      // (plus aucun camion "used" ne viendra jamais la repasser à `true`). Résultat :
+      // `all_finished` n'était jamais renvoyé à `true` à Python, qui ne déclenchait donc
+      // jamais l'arrêt automatique — horloge et kilométrage continuaient (au sens où
+      // `simulation_started` restait `true`, le bouton "🚀 Démarrer" ne réapparaissait
+      // jamais, et le panneau "🎉 Tournée terminée" ne s'affichait jamais).
+      //
+      // Correctif : si ce montage n'a plus aucun camion utilisé MAIS que toutes les
+      // commandes reçues (actives + en attente + déjà livrées, hors annulées) sont bien
+      // dans `deliveredSet`, la tournée est belle et bien terminée.
+      if (usedCount === 0 && orders.length > 0 && deliveredSet.size >= orders.length) {
+        allUsedFinished = true;
+      }
       // Suivi urgent/haute importance PAR TOURNÉE : pour chaque camion, on compte les
       // arrêts prioritaires (URGENTE/HAUTE) pas encore livrés dans SA tournée — c'est
       // ce qui permet d'afficher "V2 : 2 commandes urgentes en cours" dans le panneau
