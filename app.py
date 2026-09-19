@@ -70,6 +70,11 @@ from mqtt_manager import MQTTBridge
 
 st.set_page_config(page_title="DVRP Logistique & Tracking Alger", page_icon="🚚", layout="wide")
 
+# Marqueur visuel de priorité par arrêt dans "Séquence de l'itinéraire construite" —
+# même code couleur/symbole que sur la carte React (voir PRIORITY_COLOR/LABEL dans
+# dvrp_map_component/frontend/src/index.jsx), pour rester cohérent entre les deux vues.
+PRIORITY_MARK = {"URGENTE": "🔴 ", "HAUTE": "🟠 "}
+
 # ----------------------------------------------------------------------------
 # 1. ÉTAT DE SESSION
 # ----------------------------------------------------------------------------
@@ -482,6 +487,10 @@ with main_tab:
             if len(active_orders) > 0:
                 coords_list = [depot_coords] + list(zip(active_orders["lat"], active_orders["lon"]))
                 demands = [0] + active_orders["demand_kg"].astype(int).tolist()
+                # CORRECTIF (priorité non transmise au solveur) : sans ceci, OR-Tools
+                # optimisait uniquement la distance et pouvait livrer une commande
+                # URGENTE en dernier. Voir PRIORITY_RANK_TARGET/PENALTY dans dvrp_engine.py.
+                priorities = ["NORMALE"] + active_orders["priority"].tolist()
 
                 # Nombre de rotations par camion calculé automatiquement à partir de la demande totale
                 # et de la capacité réellement disponible (plus besoin de régler un curseur manuel).
@@ -512,7 +521,9 @@ with main_tab:
                         # La pénalité de trafic influence UNIQUEMENT la décision d'OR-Tools (pour qu'il évite
                         # la zone concernée) ; les distances affichées restent les vraies distances physiques.
                         solver_dist_matrix = (np.array(raw_dist_matrix) * st.session_state.traffic_penalty).tolist()
-                    virtual_routes = solve_dvrp_ortools(solver_dist_matrix, demands, vehicle_capacities)
+                    virtual_routes = solve_dvrp_ortools(
+                        solver_dist_matrix, demands, vehicle_capacities, priorities=priorities
+                    )
 
                 total_capacity = vehicle_capacity * virtual_vehicle_count
                 if not virtual_routes:
@@ -762,7 +773,13 @@ with main_tab:
                 # séquence de l'itinéraire construite sera mise à jour en conséquence.
                 new_arrival_id = result.get("new_order_arrived")
                 if new_arrival_id:
-                    arrival_clock = float(result.get("sim_clock", st.session_state.sim_clock_min))
+                    # CORRECTIF (clé erronée) : le composant React envoie "sim_clock_min",
+                    # pas "sim_clock" — avec la mauvaise clé, `arrival_clock` retombait
+                    # toujours sur l'ancienne valeur de session_state (jamais mise à jour),
+                    # donc l'horloge Python ne rattrapait jamais réellement l'horloge réelle
+                    # de la simulation, et la commande "arrivée" pouvait rester hors du
+                    # filtre `release_time <= sim_time` malgré ce correctif.
+                    arrival_clock = float(result.get("sim_clock_min", st.session_state.sim_clock_min))
                     st.session_state.sim_clock_min = max(st.session_state.sim_clock_min, arrival_clock)
                     log_event(f"🆕 Commande {new_arrival_id} arrivée → replanification de l'itinéraire.")
                     st.rerun()
@@ -790,6 +807,26 @@ with main_tab:
                 "et à chaque nouvelle commande qui arrive à son heure — pas seulement lors des "
                 "événements déclenchés manuellement."
             )
+
+            # CORRECTIF (tracking prioritaire absent de cette section) : le suivi
+            # urgent/haute importance n'avait été ajouté que dans la carte/tableau React
+            # — ce panneau texte natif Streamlit restait entièrement aveugle à la
+            # priorité ET à l'état livré (une commande livrée disparaît juste
+            # silencieusement de la liste au prochain recalcul, sans aucune trace).
+            n_delivered_total = len(st.session_state.delivered_ids)
+            n_orders_known = len(active_orders) + len(delivered_orders) + len(future_orders)
+            urgentes_en_cours = int((active_orders["priority"] == "URGENTE").sum())
+            hautes_en_cours = int((active_orders["priority"] == "HAUTE").sum())
+            if urgentes_en_cours or hautes_en_cours:
+                st.caption(
+                    f"📦 **{n_delivered_total}/{n_orders_known} commande(s) livrée(s)** · "
+                    + (f"🔴 {urgentes_en_cours} urgente(s) " if urgentes_en_cours else "")
+                    + (f"🟠 {hautes_en_cours} haute(s) " if hautes_en_cours else "")
+                    + "encore en tournée"
+                )
+            else:
+                st.caption(f"📦 **{n_delivered_total}/{n_orders_known} commande(s) livrée(s)**")
+
             if not truck_trips:
                 if len(future_orders) > 0:
                     st.caption(
@@ -810,7 +847,15 @@ with main_tab:
                     header += f" — {truck_total_load}/{vehicle_capacity} kg — {truck_total_km:.1f} km"
                 st.markdown(header)
                 for t_idx, route in enumerate(trips):
-                    stops_names = [plan_orders_df.iloc[node - 1]["client"] for node in route if node != 0]
+                    # PRIORITY_MARK : préfixe visuel par arrêt (🔴 URGENTE / 🟠 HAUTE), pour
+                    # repérer d'un coup d'œil, dans le texte même de la tournée, quel arrêt
+                    # est prioritaire — jusqu'ici seule la couleur du point sur la carte le
+                    # montrait, invisible dans cette liste textuelle.
+                    stops_names = [
+                        (PRIORITY_MARK.get(plan_orders_df.iloc[node - 1]["priority"], "")
+                         + plan_orders_df.iloc[node - 1]["client"])
+                        for node in route if node != 0
+                    ]
                     load = sum(plan_orders_df.iloc[node - 1]["demand_kg"] for node in route if node != 0)
                     trip_km = route_distance(route, raw_dist_matrix) / 1000
                     prefix = f"Trajet {t_idx + 1}/{len(trips)} " if len(trips) > 1 else ""

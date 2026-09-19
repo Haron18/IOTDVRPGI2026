@@ -98,6 +98,17 @@ function DvrpMap({ args }) {
   // dans la boucle d'animation pour le suivi urgent/haute importance par tournée.
   const orderPriorityRef = useRef({});
   const lastReportedRef = useRef(null);
+  // CORRECTIF (commandes "en attente" jamais routées) : `new_order_arrived` était déjà
+  // documenté et lu côté Python (app.py) mais jamais réellement renvoyé par le
+  // composant — Streamlit.setComponentValue ne l'incluait jamais. Résultat : dès
+  // qu'une commande atteignait son release_time en cours de simulation temps réel,
+  // elle apparaissait bien sur la carte (marqueur "en attente") mais l'horloge Python
+  // (qui filtre les commandes actives) ne se resynchronisait jamais toute seule —
+  // seul le bouton manuel "+10 min" la faisait avancer. La commande restait donc
+  // "en attente" indéfiniment, jamais transmise à OR-Tools, jamais livrée : le
+  // compteur "X livrées sur Y" se figeait dès qu'une commande à release_time tardif
+  // existait. Ce ref mémorise les commandes déjà signalées "arrivées" à Python.
+  const reportedVisibleIdsRef = useRef(new Set());
   // Référence "légère" pour l'horloge : mise à jour SANS reconstruire la carte (voir
   // plus bas). Sépare ce qui doit reconstruire visuellement la carte (itinéraires
   // réellement différents) de ce qui ne doit que recaler discrètement le point de
@@ -208,6 +219,12 @@ function DvrpMap({ args }) {
       orderMarkers[o.id] = { marker, haloMarker, shown: false };
     });
     orderMarkersRef.current = orderMarkers;
+    // Amorce avec les commandes déjà visibles au moment du montage (celles dont le
+    // release_time est déjà passé) : sinon la toute première frame les signalerait
+    // TOUTES comme "nouvellement arrivées", déclenchant un rerun Python inutile.
+    reportedVisibleIdsRef.current = new Set(
+      orders.filter((o) => o.release_time <= simClockStartMin).map((o) => o.id)
+    );
 
     const truckState = {};
     let usedCount = 0;
@@ -320,6 +337,22 @@ function DvrpMap({ args }) {
         lastUiUpdate = now;
         const visibleCount = orders.filter((o) => o.release_time <= simClockMin).length;
         const deliveredIds = Array.from(deliveredSet);
+
+        // CORRECTIF (voir reportedVisibleIdsRef ci-dessus) : détecte la ou les commandes
+        // qui viennent de franchir leur release_time depuis le dernier report, et en
+        // signale UNE à Python via new_order_arrived. Une seule suffit : ça déclenche
+        // la resynchronisation de l'horloge Python (sim_clock_min) sur l'horloge réelle
+        // du composant, ce qui fait automatiquement entrer TOUTES les commandes arrivées
+        // entre-temps dans `active_orders` côté Python (filtre release_time <= sim_time),
+        // pas seulement celle explicitement nommée.
+        let newlyArrivedId = null;
+        for (const o of orders) {
+          if (o.release_time <= simClockMin && !reportedVisibleIdsRef.current.has(o.id)) {
+            newlyArrivedId = o.id;
+            break;
+          }
+        }
+
         setKpi({
           simClockMin, visibleCount, totalOrders: orders.length,
           deliveredIds, distanceParcourue, allFinished: allUsedFinished,
@@ -343,7 +376,16 @@ function DvrpMap({ args }) {
             // départ ("checkpoint") du prochain recalcul OR-Tools, au lieu de
             // perdre la distance déjà parcourue à chaque réoptimisation.
             distance_parcourue_km: distanceParcourue,
+            new_order_arrived: newlyArrivedId,
           });
+          if (newlyArrivedId) {
+            // Marqué comme signalé tout de suite : le rerun Python qui va suivre va de
+            // toute façon remonter le composant avec un nouveau structuralKey (nouvel
+            // active_orders → nouvelles tournées), donc ce ref n'a de toute façon plus
+            // besoin de survivre au-delà de cette frame — mais on évite ainsi de le
+            // resignaler en boucle si le rerun tarde un peu.
+            reportedVisibleIdsRef.current.add(newlyArrivedId);
+          }
         }
       }
       frameId = requestAnimationFrame(animate);
@@ -424,6 +466,14 @@ function DvrpMap({ args }) {
         "  border-radius: 20px; padding: 4px 10px; color: #333; }" +
         ".dvrp-row-urgente td { background: #fdecea; }" +
         ".dvrp-row-haute td { background: #fff4e5; }" +
+        // CORRECTIF (teinte de priorité invisible au survol) : ".dvrp-table tr:hover td"
+        // (2 classes/pseudo-classes + 2 éléments) est PLUS spécifique que
+        // ".dvrp-row-urgente td" (1 classe + 1 élément) — donc le survol de la souris
+        // écrasait systématiquement la couleur rouge/orange par le gris générique,
+        // rendant une commande prioritaire indiscernable pile au moment où on la lit.
+        // On préfixe par ".dvrp-table" pour dépasser la spécificité du survol générique.
+        ".dvrp-table .dvrp-row-urgente:hover td { background: #f7d9d6; }" +
+        ".dvrp-table .dvrp-row-haute:hover td { background: #ffe6c2; }" +
         ".dvrp-legend { background: rgba(255,255,255,.92); padding: 8px 10px; border-radius: 8px;" +
         "  box-shadow: 0 1px 4px rgba(0,0,0,.2); font-size: 12px; line-height: 1.6; }" +
         ".dvrp-legend-row { display: flex; align-items: center; gap: 6px; }" +

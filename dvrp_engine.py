@@ -24,6 +24,20 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 OSRM_BASE_URL = "http://router.project-osrm.org"
 
+# CORRECTIF (priorité ignorée par le solveur) : avant ce correctif, `priority` n'était
+# utilisé que pour l'affichage (couleur carte, teinte tableau) — jamais transmis à
+# OR-Tools, qui optimisait donc uniquement la distance et pouvait livrer une commande
+# URGENTE en tout dernier si c'était plus court pour le camion.
+#
+# PRIORITY_RANK_TARGET : rang (nombre d'arrêts déjà faits sur SA rotation) au-delà
+# duquel une pénalité s'applique — 0 = doit être le tout premier arrêt de sa tournée.
+# PRIORITY_RANK_PENALTY : coût (en "mètres équivalents") par rang de retard au-delà
+# de la cible. Volontairement très supérieur aux distances réelles (quelques dizaines
+# de km max) pour que le solveur sacrifie l'optimalité de distance plutôt que de
+# retarder une commande urgente.
+PRIORITY_RANK_TARGET = {"URGENTE": 0, "HAUTE": 2, "NORMALE": None}
+PRIORITY_RANK_PENALTY = {"URGENTE": 100_000, "HAUTE": 20_000, "NORMALE": 0}
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_osrm_distance_matrix(coords: tuple[tuple[float, float], ...]) -> list[list[float]]:
@@ -144,11 +158,17 @@ def solve_dvrp_ortools(
     vehicle_capacities: list[int],
     depot_index: int = 0,
     time_limit_s: int = 5,
+    priorities: list[str] | None = None,
 ) -> list[list[int]]:
     """Résolution du VRP avec contrainte de capacité.
 
     `demands[i]` = poids (kg) du point i (demands[depot_index] doit valoir 0).
     `vehicle_capacities[k]` = capacité max (kg) du véhicule k.
+    `priorities[i]` (optionnel) = "URGENTE" / "HAUTE" / "NORMALE" pour le point i, même
+    indexation que `demands`. Quand fourni, une commande URGENTE est fortement poussée
+    à être le premier arrêt de sa rotation, une HAUTE dans les 2 premiers — via une
+    pénalité de rang (voir PRIORITY_RANK_TARGET/PENALTY ci-dessus), pas une contrainte
+    dure : la capacité reste toujours respectée, seule la séquence est influencée.
     Retourne une liste de tournées (chaque tournée = liste d'index dans distance_matrix),
     ou une liste vide si aucune solution n'a été trouvée (ex: capacité totale insuffisante).
     """
@@ -176,6 +196,24 @@ def solve_dvrp_ortools(
         True,                   # le compteur repart de 0 au dépôt
         "Capacity",
     )
+
+    if priorities is not None:
+        # Dimension "Rang" : +1 à chaque arrêt effectué depuis le dépôt, remise à 0 à
+        # chaque nouveau départ (donc par rotation, pour les véhicules virtuels multi-
+        # trajets). SetCumulVarSoftUpperBound pénalise un rang au-delà de la cible —
+        # c'est ce qui fait "remonter" les commandes prioritaires en tête de tournée.
+        rank_callback_index = routing.RegisterUnaryTransitCallback(lambda _idx: 1)
+        routing.AddDimension(rank_callback_index, 0, len(distance_matrix), True, "Rank")
+        rank_dimension = routing.GetDimensionOrDie("Rank")
+        for node, prio in enumerate(priorities):
+            if node == depot_index:
+                continue
+            target = PRIORITY_RANK_TARGET.get(prio)
+            penalty = PRIORITY_RANK_PENALTY.get(prio, 0)
+            if target is not None and penalty > 0:
+                rank_dimension.SetCumulVarSoftUpperBound(
+                    manager.NodeToIndex(node), target, penalty
+                )
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
